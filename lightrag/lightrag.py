@@ -3319,6 +3319,30 @@ class LightRAG:
         # Return the dictionary containing statuses only for the found document IDs
         return found_statuses
 
+    async def _chunk_ids_listed_by_other_docs(
+        self, doc_id: str, chunk_ids: set[str]
+    ) -> set[str]:
+        """Return the ids in ``chunk_ids`` that another document of this workspace also lists.
+
+        Chunk ids are content hashes, so a passage two documents have in common
+        is one chunk listed by both. Documents in every status count: a failed
+        or in-progress document may still list chunks it will use once processed.
+        """
+        other_docs = await self.doc_status.get_docs_by_statuses(list(DocStatus))
+        shared: set[str] = set()
+        for other_id, status in other_docs.items():
+            if other_id == doc_id:
+                continue
+            listed = (
+                status.get("chunks_list")
+                if isinstance(status, dict)
+                else getattr(status, "chunks_list", None)
+            ) or []
+            shared.update(chunk_id for chunk_id in listed if chunk_id in chunk_ids)
+            if len(shared) == len(chunk_ids):
+                break
+        return shared
+
     async def adelete_by_doc_id(
         self, doc_id: str, delete_llm_cache: bool = False
     ) -> DeletionResult:
@@ -3491,8 +3515,37 @@ class LightRAG:
                 )
             )
 
+            # A chunk id is a hash of the chunk's text alone, so two documents with
+            # an identical passage (the unchanged sections of an edited file, the
+            # same file uploaded under another name) share that chunk. Deleting it
+            # here took the passage out of the other document as well: that
+            # document stayed "processed" but could no longer be retrieved. Every
+            # chunk another document still lists is kept, together with its graph
+            # sources and LLM cache; only this document's own chunks are removed.
+            shared_chunk_ids: set[str] = set()
+            if chunk_ids:
+                deletion_stage = "find_shared_chunks"
+                shared_chunk_ids = await self._chunk_ids_listed_by_other_docs(
+                    doc_id, chunk_ids
+                )
+                if shared_chunk_ids:
+                    chunk_ids -= shared_chunk_ids
+                    shared_msg = (
+                        f"Keeping {len(shared_chunk_ids)} chunk(s) of {doc_id} that "
+                        f"other documents share; deleting {len(chunk_ids)}"
+                    )
+                    logger.info(shared_msg)
+                    async with pipeline_status_lock:
+                        pipeline_status["latest_message"] = shared_msg
+                        pipeline_status["history_messages"].append(shared_msg)
+
             if not chunk_ids:
-                logger.warning(f"No chunks found for document {doc_id}")
+                if shared_chunk_ids:
+                    logger.info(
+                        f"Every chunk of document {doc_id} is shared with another document; keeping them"
+                    )
+                else:
+                    logger.warning(f"No chunks found for document {doc_id}")
                 # Mark that deletion operations have started
                 deletion_operations_started = True
 
@@ -3531,6 +3584,13 @@ class LightRAG:
                         ) from cache_err
 
                 try:
+                    if shared_chunk_ids:
+                        # Its entities and relations came from the shared chunks,
+                        # which another document still owns: drop only this
+                        # document's index of them.
+                        deletion_stage = "delete_doc_graph_metadata"
+                        await self.full_entities.delete([doc_id])
+                        await self.full_relations.delete([doc_id])
                     # Still need to delete the doc status and full doc.
                     # Delete doc_status first: if full_docs.delete fails on retry, the
                     # doc_status record is already gone so the retry finds no record and
@@ -3546,7 +3606,9 @@ class LightRAG:
 
                 async with pipeline_status_lock:
                     log_message = (
-                        f"Document deleted without associated chunks: {doc_id}"
+                        f"Document deleted; its {len(shared_chunk_ids)} chunk(s) are shared with other documents and were kept: {doc_id}"
+                        if shared_chunk_ids
+                        else f"Document deleted without associated chunks: {doc_id}"
                     )
                     logger.info(log_message)
                     pipeline_status["latest_message"] = log_message
